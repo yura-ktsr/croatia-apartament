@@ -2,30 +2,28 @@ import os
 import time
 import requests
 from bs4 import BeautifulSoup
+from deep_translator import GoogleTranslator
 
 # --- Налаштування ---
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = os.environ.get("TELEGRAM_CHANNEL_ID")
 IDS_FILE = "last_ids.txt"
-
 BASE_URL = "https://www.njuskalo.hr/iznajmljivanje-stanova/split?sort=new"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "hr-HR,hr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
+def translate_text(text, dest_lang='en'):
+    try:
+        if not text: return ""
+        return GoogleTranslator(source='auto', target=dest_lang).translate(text)
+    except:
+        return text
+
 def load_ids():
-    if not os.path.exists(IDS_FILE):
-        return set()
+    if not os.path.exists(IDS_FILE): return set()
     with open(IDS_FILE, "r") as f:
         return set(line.strip() for line in f if line.strip())
 
@@ -36,162 +34,104 @@ def save_id(ad_id):
 def get_listings():
     try:
         session = requests.Session()
-        # Спочатку заходимо на головну — щоб отримати cookies
-        session.get("https://www.njuskalo.hr", headers=HEADERS, timeout=15)
-        time.sleep(2)
-        # Тепер робимо реальний запит
         resp = session.get(BASE_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        print(f"Статус відповіді: {resp.status_code}")
-        print(f"Розмір сторінки: {len(resp.text)} символів")
-    except Exception as e:
-        print(f"Помилка завантаження сторінки: {e}")
-        return []
-
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    # Пробуємо різні селектори
-    listings = []
-
-    # Варіант 1 — старий селектор
-    items = soup.select("article.entity-body")
-    print(f"Варіант 1 (article.entity-body): {len(items)} елементів")
-
-    # Варіант 2
-    if not items:
-        items = soup.select("li.EntityList-item--Regular")
-        print(f"Варіант 2 (li.EntityList-item--Regular): {len(items)} елементів")
-
-    # Варіант 3
-    if not items:
-        items = soup.select("article")
-        print(f"Варіант 3 (article): {len(items)} елементів")
-
-    # Варіант 4 — будь-які посилання на оголошення
-    if not items:
-        links = soup.select("a[href*='/iznajmljivanje-stanova/']")
-        print(f"Варіант 4 (посилання): {len(links)} елементів")
-        for link in links[:10]:
-            print(f"  Знайдено посилання: {link.get('href', '')[:80]}")
-        return []
-
-    for item in items[:10]:
-        try:
-            link_tag = (
-                item.select_one("a.entity-description-title") or
-                item.select_one("a.entity-title") or
-                item.select_one("h3 a") or
-                item.select_one("h2 a") or
-                item.select_one("a[href*='njuskalo']")
-            )
-            if not link_tag:
-                print(f"Не знайдено посилання в елементі: {str(item)[:100]}")
-                continue
-
-            href = link_tag.get("href", "")
-            url = href if href.startswith("http") else "https://www.njuskalo.hr" + href
+        soup = BeautifulSoup(resp.text, "lxml")
+        
+        listings = []
+        items = soup.select("li.EntityList-item--Regular, li.EntityList-item--VauVau")
+        
+        for item in items[:10]:
+            link_tag = item.select_one("h3.entity-title a")
+            if not link_tag: continue
+            
+            url = "https://www.njuskalo.hr" + link_tag["href"]
             ad_id = url.rstrip("/").split("/")[-1].split("?")[0]
             title = link_tag.get_text(strip=True)
+            
+            price_tag = item.select_one(".price-items .price--eur")
+            price = price_tag.get_text(strip=True) if price_tag else "Check site"
+            
+            listings.append({"id": ad_id, "url": url, "title": title, "price": price})
+        return listings
+    except Exception as e:
+        print(f"Error fetching listings: {e}")
+        return []
 
-            price_tag = (
-                item.select_one(".price-box") or
-                item.select_one(".price") or
-                item.select_one("[class*='price']")
-            )
-            price = price_tag.get_text(strip=True) if price_tag else "Ціна не вказана"
-
-            listings.append({
-                "id": ad_id,
-                "url": url,
-                "title": title,
-                "price": price,
-            })
-        except Exception as e:
-            print(f"Помилка парсингу елементу: {e}")
-            continue
-
-    return listings
-
-def get_photos(url):
+def get_details(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(resp.text, "lxml")
+        
+        # Витягуємо фото
         photos = []
-        for img in soup.select("img.gallery-foto, img[class*='gallery'], img[class*='photo']")[:8]:
+        for img in soup.select("img.gallery-foto")[:10]:
             src = img.get("data-src") or img.get("src")
-            if src and src.startswith("http"):
-                photos.append(src)
-        return photos
-    except Exception as e:
-        print(f"Помилка отримання фото: {e}")
-        return []
+            if src and "images" in src: photos.append(src)
+            
+        # Витягуємо параметри (площа, кімнати)
+        details_text = ""
+        for meta in soup.select(".ClassifiedDetailBasicDetails-list dt, .ClassifiedDetailBasicDetails-list dd"):
+            details_text += meta.get_text(strip=True) + " "
+            
+        # Витягуємо опис
+        desc_tag = soup.select_one(".ClassifiedDetailDescription-text")
+        description = desc_tag.get_text(separator="\n", strip=True) if desc_tag else ""
+        
+        return {
+            "photos": photos,
+            "description": translate_text(description[:500] + "..."),
+            "title_en": translate_text(soup.select_one("h1.ClassifiedDetailSummary-title").get_text(strip=True) if soup.select_one("h1.ClassifiedDetailSummary-title") else "")
+        }
+    except:
+        return {"photos": [], "description": "", "title_en": ""}
 
 def send_post(listing):
-    photos = get_photos(listing["url"])
+    details = get_details(listing["url"])
     time.sleep(1)
-
+    
+    # Формуємо шаблон
     caption = (
-        f"🏠 *{listing['title']}*\n\n"
-        f"💰 {listing['price']}\n\n"
-        f"🔗 [Переглянути оголошення]({listing['url']})"
+        f"🏠 **{details['title_en'] or listing['title']}**\n\n"
+        f"💰 **Price:** {listing['price']}\n"
+        f"📍 **Location:** Split, Croatia\n\n"
+        f"📝 **Description:**\n{details['description']}\n\n"
+        f"🔗 [View on Njuskalo]({listing['url']})\n\n"
+        f"#split #croatia #rent"
     )
 
     api_base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-    if len(photos) >= 2:
+    if len(details['photos']) >= 2:
         media = []
-        for i, photo_url in enumerate(photos[:8]):
+        for i, p_url in enumerate(details['photos'][:10]):
             media.append({
                 "type": "photo",
-                "media": photo_url,
+                "media": p_url,
                 "caption": caption if i == 0 else "",
-                "parse_mode": "Markdown" if i == 0 else "",
+                "parse_mode": "Markdown"
             })
-        resp = requests.post(f"{api_base}/sendMediaGroup", json={
-            "chat_id": CHANNEL_ID,
-            "media": media,
-        })
-    elif len(photos) == 1:
-        resp = requests.post(f"{api_base}/sendPhoto", json={
-            "chat_id": CHANNEL_ID,
-            "photo": photos[0],
-            "caption": caption,
-            "parse_mode": "Markdown",
-        })
+        requests.post(f"{api_base}/sendMediaGroup", json={"chat_id": CHANNEL_ID, "media": media})
     else:
-        resp = requests.post(f"{api_base}/sendMessage", json={
-            "chat_id": CHANNEL_ID,
-            "text": caption,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False,
-        })
-
-    if resp.status_code == 200:
-        print(f"✅ Опубліковано: {listing['title']}")
-    else:
-        print(f"❌ Помилка Telegram: {resp.text}")
+        photo = details['photos'][0] if details['photos'] else "https://via.placeholder.com/500"
+        requests.post(f"{api_base}/sendPhoto", json={"chat_id": CHANNEL_ID, "photo": photo, "caption": caption, "parse_mode": "Markdown"})
 
 def main():
-    print("🔄 Запуск парсера...")
+    print("🔄 Starting English parser...")
     known_ids = load_ids()
     listings = get_listings()
 
-    if not listings:
-        print("Оголошень не знайдено або сайт заблокував запит.")
-        return
-
     new_count = 0
     for listing in listings:
-        if listing["id"] in known_ids:
-            continue
-        print(f"🆕 Нове оголошення: {listing['title']}")
+        if listing["id"] in known_ids: continue
+        print(f"🆕 New listing found: {listing['id']}")
         send_post(listing)
         save_id(listing["id"])
         known_ids.add(listing["id"])
         new_count += 1
-        time.sleep(3)
+        time.sleep(5) # Пауза, щоб не забанили
 
-    print(f"✅ Готово. Нових оголошень: {new_count}")
+    print(f"✅ Done. New posts: {new_count}")
 
 if __name__ == "__main__":
     main()
