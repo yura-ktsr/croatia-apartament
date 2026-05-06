@@ -34,8 +34,9 @@ jobs:
 
       - name: Save last_ids.txt back to repo
         run: |
+          touch last_ids.txt
           git config user.name "github-actions"
           git config user.email "actions@github.com"
-          git add last_ids.txt || true
+          git add last_ids.txt
           git diff --staged --quiet || git commit -m "Update last_ids"
           git push || true
