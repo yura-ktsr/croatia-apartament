@@ -11,45 +11,93 @@ IDS_FILE = "last_ids.txt"
 BASE_URL = "https://www.njuskalo.hr/iznajmljivanje-stanova/split?sort=new"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "hr,en;q=0.9",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "hr-HR,hr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
 }
 
-# --- Завантаження збережених ID ---
 def load_ids():
     if not os.path.exists(IDS_FILE):
         return set()
     with open(IDS_FILE, "r") as f:
         return set(line.strip() for line in f if line.strip())
 
-# --- Збереження нового ID ---
 def save_id(ad_id):
     with open(IDS_FILE, "a") as f:
         f.write(ad_id + "\n")
 
-# --- Отримання списку оголошень ---
 def get_listings():
     try:
-        resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
+        session = requests.Session()
+        # Спочатку заходимо на головну — щоб отримати cookies
+        session.get("https://www.njuskalo.hr", headers=HEADERS, timeout=15)
+        time.sleep(2)
+        # Тепер робимо реальний запит
+        resp = session.get(BASE_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
+        print(f"Статус відповіді: {resp.status_code}")
+        print(f"Розмір сторінки: {len(resp.text)} символів")
     except Exception as e:
         print(f"Помилка завантаження сторінки: {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # Пробуємо різні селектори
     listings = []
 
-    for item in soup.select("article.entity-body"):
+    # Варіант 1 — старий селектор
+    items = soup.select("article.entity-body")
+    print(f"Варіант 1 (article.entity-body): {len(items)} елементів")
+
+    # Варіант 2
+    if not items:
+        items = soup.select("li.EntityList-item--Regular")
+        print(f"Варіант 2 (li.EntityList-item--Regular): {len(items)} елементів")
+
+    # Варіант 3
+    if not items:
+        items = soup.select("article")
+        print(f"Варіант 3 (article): {len(items)} елементів")
+
+    # Варіант 4 — будь-які посилання на оголошення
+    if not items:
+        links = soup.select("a[href*='/iznajmljivanje-stanova/']")
+        print(f"Варіант 4 (посилання): {len(links)} елементів")
+        for link in links[:10]:
+            print(f"  Знайдено посилання: {link.get('href', '')[:80]}")
+        return []
+
+    for item in items[:10]:
         try:
-            link_tag = item.select_one("a.entity-description-title")
+            link_tag = (
+                item.select_one("a.entity-description-title") or
+                item.select_one("a.entity-title") or
+                item.select_one("h3 a") or
+                item.select_one("h2 a") or
+                item.select_one("a[href*='njuskalo']")
+            )
             if not link_tag:
+                print(f"Не знайдено посилання в елементі: {str(item)[:100]}")
                 continue
 
-            url = "https://www.njuskalo.hr" + link_tag["href"]
-            ad_id = url.split("/")[-1].split("?")[0]
+            href = link_tag.get("href", "")
+            url = href if href.startswith("http") else "https://www.njuskalo.hr" + href
+            ad_id = url.rstrip("/").split("/")[-1].split("?")[0]
             title = link_tag.get_text(strip=True)
 
-            price_tag = item.select_one(".price-box")
+            price_tag = (
+                item.select_one(".price-box") or
+                item.select_one(".price") or
+                item.select_one("[class*='price']")
+            )
             price = price_tag.get_text(strip=True) if price_tag else "Ціна не вказана"
 
             listings.append({
@@ -64,13 +112,12 @@ def get_listings():
 
     return listings
 
-# --- Отримання фото з оголошення ---
 def get_photos(url):
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "lxml")
         photos = []
-        for img in soup.select("img.gallery-foto")[:8]:
+        for img in soup.select("img.gallery-foto, img[class*='gallery'], img[class*='photo']")[:8]:
             src = img.get("data-src") or img.get("src")
             if src and src.startswith("http"):
                 photos.append(src)
@@ -79,7 +126,6 @@ def get_photos(url):
         print(f"Помилка отримання фото: {e}")
         return []
 
-# --- Відправка посту в Telegram ---
 def send_post(listing):
     photos = get_photos(listing["url"])
     time.sleep(1)
@@ -125,7 +171,6 @@ def send_post(listing):
     else:
         print(f"❌ Помилка Telegram: {resp.text}")
 
-# --- Головна функція ---
 def main():
     print("🔄 Запуск парсера...")
     known_ids = load_ids()
